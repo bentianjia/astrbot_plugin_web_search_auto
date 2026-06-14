@@ -2,12 +2,12 @@
 astrbot_plugin_web_search_auto
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-基于 SearXNG 的自动网络搜索插件。
-LLM 自主决定何时调用 web_search / web_fetch，无需命令前缀。
+自动网络搜索插件 — on_llm_request 拦截用户消息，后台自动搜索，
+结果注入 system prompt 作为上下文，LLM 自然回复。
 
-参考 Claude Code 的 WebSearch / WebFetch 工具设计：
-- web_search: 搜索网络，返回标题 / URL / 摘要
-- web_fetch:  获取网页全文，提取正文内容
+不依赖 function calling，弱模型也能用。
+
+参考 Claude Code 的 WebSearch / WebFetch 设计。
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ import asyncio
 import hashlib
 import re
 import time
+from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from html import unescape
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -33,40 +34,27 @@ from astrbot.api import logger
 # 常量
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_HINT = (
-    '## Web Search Capability\n'
-    'You have two web tools available. Use them PROACTIVELY — '
-    'if you are unsure about facts, dates, news, or any real-time information, '
-    'search the web rather than guessing.\n\n'
-    '1. **web_search(query, max_results=10, allowed_domains, blocked_domains)**\n'
-    '   Search the web. Returns title / URL / snippet for each result.\n'
-    '2. **web_fetch(url)**\n'
-    '   Fetch the full content of a web page for detailed reading.\n\n'
-    'Workflow: search first, then fetch specific pages if the snippets are insufficient.\n'
-    'Always cite your sources when using information from the web.'
-)
-
-DEFAULT_SEARXNG_URL = "http://localhost:8080"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# HTML 标签：提取正文时移除
 REMOVE_TAGS = ["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"]
 
 
 # ---------------------------------------------------------------------------
-# 配置数据类
+# 配置
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PluginConfig:
-    """插件配置，从 _conf_schema.json / WebUI 加载。"""
-    searxng_url: str = DEFAULT_SEARXNG_URL
-    max_results: int = 10
-    cache_ttl: int = 900          # 秒，0 = 禁用
+    """插件配置。默认用 DuckDuckGo，零部署。"""
+    search_backend: str = "bing"          # bing | duckduckgo | searxng
+    searxng_url: str = "http://localhost:8080"
+    proxy: str = ""                       # 代理地址，如 http://127.0.0.1:7890
+    max_results: int = 5
+    cache_ttl: int = 900
     cache_max_size: int = 100
     fetch_timeout: int = 15
     fetch_max_chars: int = 10000
@@ -78,8 +66,10 @@ class PluginConfig:
         if not isinstance(cfg, dict) or not cfg:
             return cls()
         return cls(
-            searxng_url=str(cfg.get("searxng_url", DEFAULT_SEARXNG_URL)).rstrip("/"),
-            max_results=_clamp(int(cfg.get("max_results", 10)), 1, 20),
+            search_backend=str(cfg.get("search_backend", "bing")),
+            searxng_url=str(cfg.get("searxng_url", "http://localhost:8080")).rstrip("/"),
+            proxy=str(cfg.get("proxy", "")).strip(),
+            max_results=_clamp(int(cfg.get("max_results", 5)), 1, 20),
             cache_ttl=max(int(cfg.get("cache_ttl", 900)), 0),
             cache_max_size=max(int(cfg.get("cache_max_size", 100)), 1),
             fetch_timeout=_clamp(int(cfg.get("fetch_timeout", 15)), 3, 60),
@@ -89,11 +79,11 @@ class PluginConfig:
 
 
 # ---------------------------------------------------------------------------
-# 页面缓存
+# 页面缓存（类似 Claude Code 的 15 分钟缓存策略）
 # ---------------------------------------------------------------------------
 
 class PageCache:
-    """基于 OrderedDict 的 FIFO 缓存，TTL 到期自动淘汰。"""
+    """FIFO + TTL 缓存。TTL=0 时禁用缓存。"""
 
     def __init__(self, ttl: int = 900, max_size: int = 100) -> None:
         self._ttl = ttl
@@ -123,16 +113,179 @@ class PageCache:
         if key in self._data:
             del self._data[key]
         elif len(self._data) >= self._max_size:
-            self._data.popitem(last=False)  # 淘汰最旧
+            self._data.popitem(last=False)
         self._data[key] = (content, time.monotonic())
 
 
 # ---------------------------------------------------------------------------
-# 搜索 & 获取
+# 搜索后端适配器（参考 Claude Code 的 Adapter Factory 模式）
 # ---------------------------------------------------------------------------
 
-class SearXNGSearcher:
-    """SearXNG JSON API 封装。"""
+class BaseSearcher(ABC):
+    """搜索后端抽象基类。"""
+
+    @abstractmethod
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        allowed_domains: Optional[List[str]] = None,
+        blocked_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        """返回 [{title, url, snippet}, ...]。"""
+        ...
+
+
+class DuckDuckGoSearcher(BaseSearcher):
+    """
+    DuckDuckGo 搜索后端。
+    使用 ddgs 库直接搜多个搜索引擎（Brave/Yahoo/Bing 等），
+    类似 Claude Code 的 scraping 方式，无需 API Key，无需部署服务。
+    """
+
+    def __init__(self, proxy: str = "") -> None:
+        self._proxy = proxy or None
+        self._ddgs = None
+        self._import_error: Optional[str] = None
+
+    def _get_ddgs(self):
+        """惰性导入 ddgs 库。"""
+        if self._ddgs is not None:
+            return self._ddgs
+        if self._import_error:
+            raise ImportError(self._import_error)
+        try:
+            from ddgs import DDGS
+            self._ddgs = DDGS
+        except ImportError as e:
+            self._import_error = (
+                f"需要安装 ddgs 库: pip install ddgs\n"
+                f"原始错误: {e}"
+            )
+            raise ImportError(self._import_error) from e
+        return self._ddgs
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        allowed_domains: Optional[List[str]] = None,
+        blocked_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        DDGS = self._get_ddgs()
+
+        loop = asyncio.get_event_loop()
+
+        def _do_search() -> List[Dict[str, str]]:
+            results: List[Dict[str, str]] = []
+            kwargs = {}
+            if self._proxy:
+                kwargs["proxy"] = self._proxy
+            with DDGS(**kwargs) as ddgs:
+                for item in ddgs.text(query, max_results=max_results):
+                    url_str = item.get("href", "")
+                    if not url_str:
+                        continue
+                    hostname = _hostname(url_str)
+                    if allowed_domains and hostname not in allowed_domains:
+                        continue
+                    if blocked_domains and hostname in blocked_domains:
+                        continue
+                    results.append({
+                        "title": item.get("title", ""),
+                        "url": url_str,
+                        "snippet": item.get("body", ""),
+                    })
+            return results
+
+        return await loop.run_in_executor(None, _do_search)
+
+
+class BingSearcher(BaseSearcher):
+    """
+    Bing 搜索后端 — 直接爬 cn.bing.com 的 HTML 搜索结果。
+    类似 Claude Code 的 BingSearchAdapter，无需 API Key，无需代理。
+    cn.bing.com 国内可直接访问。
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, proxy: str = "") -> None:
+        self._session = session
+        self._proxy = proxy
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        allowed_domains: Optional[List[str]] = None,
+        blocked_domains: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        url = "https://cn.bing.com/search"
+        params = {"q": query, "count": max_results}
+        headers = {"User-Agent": DEFAULT_USER_AGENT}
+
+        try:
+            async with self._session.get(
+                url,
+                params=params,
+                headers=headers,
+                proxy=self._proxy or None,
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Bing returned {resp.status}")
+                    return []
+                html = await resp.text(encoding="utf-8", errors="replace")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error(f"Bing request failed: {exc}")
+            return []
+
+        return self._parse_results(html, max_results, allowed_domains, blocked_domains)
+
+    def _parse_results(
+        self,
+        html: str,
+        max_results: int,
+        allowed_domains: Optional[List[str]],
+        blocked_domains: Optional[List[str]],
+    ) -> List[Dict[str, str]]:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return []
+
+        results: List[Dict[str, str]] = []
+        for li in soup.select("li.b_algo"):
+            h2 = li.find("h2")
+            a_tag = h2.find("a") if h2 else None
+            if not a_tag:
+                continue
+
+            url_str = a_tag.get("href", "")
+            title = a_tag.get_text(strip=True)
+            if not url_str or not title:
+                continue
+
+            # 域名过滤
+            hostname = _hostname(url_str)
+            if allowed_domains and hostname not in allowed_domains:
+                continue
+            if blocked_domains and hostname in blocked_domains:
+                continue
+
+            # 摘要
+            snippet = ""
+            cap_p = li.select_one(".b_caption p") or li.select_one("p")
+            if cap_p:
+                snippet = cap_p.get_text(strip=True)
+
+            results.append({"title": title, "url": url_str, "snippet": snippet})
+            if len(results) >= max_results:
+                break
+
+        return results
+
+
+class SearXNGSearcher(BaseSearcher):
+    """SearXNG JSON API 后端 — 可选，适合自托管场景。"""
 
     def __init__(self, base_url: str, session: aiohttp.ClientSession) -> None:
         self._base_url = base_url
@@ -145,7 +298,6 @@ class SearXNGSearcher:
         allowed_domains: Optional[List[str]] = None,
         blocked_domains: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
-        """执行 SearXNG 搜索，返回 [{title, url, snippet}, ...]。"""
         params: Dict[str, Any] = {
             "format": "json",
             "q": query,
@@ -162,13 +314,9 @@ class SearXNGSearcher:
                     text = await resp.text()
                     logger.error(f"SearXNG returned {resp.status}: {text[:300]}")
                     return []
-
                 data = await resp.json()
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error(f"SearXNG request failed: {exc}")
-            return []
-        except asyncio.TimeoutError:
-            logger.error("SearXNG request timed out")
             return []
 
         raw: List[dict] = data.get("results", [])
@@ -180,25 +328,42 @@ class SearXNGSearcher:
             url_str = item.get("url", "")
             if not url_str:
                 continue
-
-            # 域名过滤
             hostname = _hostname(url_str)
             if allowed_domains and hostname not in allowed_domains:
                 continue
             if blocked_domains and hostname in blocked_domains:
                 continue
-
             results.append({
                 "title": item.get("title", ""),
                 "url": url_str,
                 "snippet": item.get("content", item.get("snippet", "")),
             })
-
             if len(results) >= max_results:
                 break
-
         return results
 
+
+def create_searcher(config: PluginConfig, session: Optional[aiohttp.ClientSession] = None) -> BaseSearcher:
+    """搜索后端工厂函数 — 类似 Claude Code 的 createAdapter()。"""
+    if config.search_backend == "duckduckgo":
+        logger.info(f"Using DuckDuckGo backend (ddgs){' with proxy' if config.proxy else ''}")
+        return DuckDuckGoSearcher(proxy=config.proxy)
+    elif config.search_backend == "searxng":
+        if session is None:
+            raise ValueError("SearXNG 后端需要 aiohttp.ClientSession")
+        logger.info(f"Using SearXNG backend: {config.searxng_url}")
+        return SearXNGSearcher(config.searxng_url, session)
+    else:
+        # 默认 bing — 国内直连，类似 Claude Code 的 BingSearchAdapter
+        if session is None:
+            raise ValueError("Bing 后端需要 aiohttp.ClientSession")
+        logger.info("Using Bing backend (cn.bing.com, no proxy needed)")
+        return BingSearcher(session, proxy=config.proxy)
+
+
+# ---------------------------------------------------------------------------
+# 页面获取（类似 Claude Code 的 WebFetch — 本地 HTTP + 正文提取）
+# ---------------------------------------------------------------------------
 
 class PageFetcher:
     """异步网页获取 + BeautifulSoup 正文提取。"""
@@ -216,14 +381,12 @@ class PageFetcher:
         self._max_chars = max_chars
 
     async def fetch(self, url: str) -> str:
-        # 1. 查缓存
         cache_key = _cache_key(url)
         if self._cache.enabled:
             cached = await self._cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        # 2. HTTP GET
         try:
             async with self._session.get(
                 url,
@@ -234,7 +397,6 @@ class PageFetcher:
             ) as resp:
                 if resp.status != 200:
                     return f"[Error] HTTP {resp.status}"
-
                 content_type = resp.headers.get("Content-Type", "")
                 html = await resp.text(encoding="utf-8", errors="replace")
         except asyncio.TimeoutError:
@@ -242,21 +404,17 @@ class PageFetcher:
         except aiohttp.ClientError as exc:
             return f"[Error] {exc}"
 
-        # 3. 提取正文
         if "text/html" in content_type or not content_type:
             text = _html_to_text(html)
         else:
-            # 非 HTML：直接返回截断的原文
             text = html.strip()
 
         if not text:
             return "[Error] No readable content extracted"
 
-        # 4. 截断
         if len(text) > self._max_chars:
             text = text[:self._max_chars] + "\n\n[... content truncated]"
 
-        # 5. 写缓存
         if self._cache.enabled:
             await self._cache.set(cache_key, text)
 
@@ -268,25 +426,22 @@ class PageFetcher:
 # ---------------------------------------------------------------------------
 
 def _html_to_text(html: str) -> str:
-    """用 BeautifulSoup + lxml 提取可读文本。"""
+    """BeautifulSoup + lxml 提取可读文本。"""
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
-        # lxml 失败时回退到 html.parser
         soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(REMOVE_TAGS):
         tag.decompose()
 
     text = soup.get_text(separator="\n", strip=True)
-    # 合并多余空行
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return unescape(text)
 
 
 def _hostname(url: str) -> str:
-    """提取 URL 的 hostname，如 https://docs.example.com/path → docs.example.com"""
     try:
         return urlparse(url).hostname or ""
     except Exception:
@@ -294,7 +449,6 @@ def _hostname(url: str) -> str:
 
 
 def _cache_key(url: str) -> str:
-    """生成缓存键（URL 的 SHA256 前 16 位）。"""
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
@@ -303,20 +457,20 @@ def _clamp(val: int, lo: int, hi: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 插件主体
+# 插件主体 — 自动搜索模式
+#
+# 策略：不依赖 LLM 的 function calling（弱模型不会用），
+# 而是 on_llm_request 拦截用户消息 → 后台自动搜 → 结果注入 system prompt
+# → LLM 像平常一样回复，自然用上搜索上下文。
 # ---------------------------------------------------------------------------
 
-@register("web_search_auto", "AstrBot Community", "自动网络搜索（基于 SearXNG）", "1.0.0")
+@register("web_search_auto", "bentianjia", "自动网络搜索（Bing 直连零部署）", "2.0.0")
 class WebSearchAuto(Star):
     """
-    自动网络搜索插件。
+    自动网络搜索插件 — LLM 无需命令前缀，无需 function calling。
 
-    暴露两个 LLM 工具：
-    - web_search: 搜索网络
-    - web_fetch:  获取网页内容
-
-    LLM 自主判断何时需要搜索，无需用户输入命令前缀。
-    参考 Claude Code 的 WebSearch / WebFetch 实现。
+    在每次 LLM 请求前自动搜索用户消息，将搜索结果作为上下文注入，
+    LLM 根据语境自然筛选和回复。
     """
 
     def __init__(self, context: Context) -> None:
@@ -324,14 +478,15 @@ class WebSearchAuto(Star):
         self._config: Optional[PluginConfig] = None
         self._http: Optional[aiohttp.ClientSession] = None
         self._cache: Optional[PageCache] = None
-        self._searcher: Optional[SearXNGSearcher] = None
+        self._searcher: Optional[BaseSearcher] = None
         self._fetcher: Optional[PageFetcher] = None
         self._init_lock = asyncio.Lock()
+        # 防重复搜：同一会话的上一轮 query
+        self._last_query: str = ""
 
     # ---- 生命周期 ----------------------------------------------------------
 
     async def _ensure_initialized(self) -> None:
-        """懒初始化：第一次工具调用时创建 session 和子组件。"""
         if self._config is not None:
             return
         async with self._init_lock:
@@ -345,10 +500,7 @@ class WebSearchAuto(Star):
             self._http = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30),
             )
-            self._searcher = SearXNGSearcher(
-                base_url=self._config.searxng_url,
-                session=self._http,
-            )
+            self._searcher = create_searcher(self._config, self._http)
             self._fetcher = PageFetcher(
                 session=self._http,
                 cache=self._cache,
@@ -357,12 +509,11 @@ class WebSearchAuto(Star):
             )
             logger.info(
                 f"web_search_auto initialized: "
-                f"searxng={self._config.searxng_url}, "
+                f"backend={self._config.search_backend}, "
                 f"cache_ttl={self._config.cache_ttl}s"
             )
 
     async def terminate(self) -> None:
-        """插件卸载时清理。"""
         if self._http:
             await self._http.close()
             self._http = None
@@ -372,116 +523,80 @@ class WebSearchAuto(Star):
         self._cache = None
         logger.info("web_search_auto plugin unloaded.")
 
-    # ---- LLM 系统提示注入 --------------------------------------------------
+    # ---- 核心：自动搜索 + 注入上下文 ----------------------------------------
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        """在每次 LLM 请求前注入搜索工具的使用提示。"""
-        await self._ensure_initialized()
-        if self._config and self._config.enable_prompt_hint:
-            if req.system_prompt:
-                req.system_prompt += "\n\n" + SYSTEM_PROMPT_HINT
-            else:
-                req.system_prompt = SYSTEM_PROMPT_HINT
-
-    # ---- LLM 工具: web_search -----------------------------------------------
-
-    @filter.llm_tool(name="web_search")
-    async def web_search(
-        self,
-        event: AstrMessageEvent,
-        query: str,
-        max_results: int = 10,
-        allowed_domains: Optional[List[str]] = None,
-        blocked_domains: Optional[List[str]] = None,
-    ):
         """
-        通过网络搜索获取最新信息。当你不确定某个事实、日期、新闻事件，
-        或需要实时数据时，应主动调用此工具。
-
-        Args:
-            query(string): 搜索查询词。使用精确、关键词丰富的查询以获得最佳结果。
-            max_results(int): 返回的最大结果数量，范围 1-20。默认为 10。
-            allowed_domains(list, optional): 返回的结果限定的域名列表，如 ["wikipedia.org"]。
-            blocked_domains(list, optional): 排除的域名列表。与 allowed_domains 不可同时使用。
+        拦截 LLM 请求 → 用用户消息自动搜索 → 结果注入 system prompt。
+        LLM 无需 function calling，直接基于上下文回复。
         """
         await self._ensure_initialized()
-
-        if not query or not query.strip():
-            yield event.plain_result("[web_search Error] query 不能为空。")
+        if not self._config:
             return
 
-        max_results = _clamp(max_results, 1, 20)
-
-        # allowed_domains 和 blocked_domains 互斥
-        if allowed_domains and blocked_domains:
-            yield event.plain_result(
-                "[web_search Error] allowed_domains 和 blocked_domains 不能同时指定。"
-            )
+        # 获取用户消息文本
+        user_msg = _get_event_text(event)
+        if not user_msg or len(user_msg) < 4:
             return
 
-        logger.info(
-            f"web_search: query='{query[:80]}', max_results={max_results}"
-        )
+        # 避免重复搜同一句
+        if user_msg == self._last_query:
+            return
+        self._last_query = user_msg
 
+        logger.info(f"auto-search triggered: '{user_msg[:60]}'")
+
+        # 后台搜索
         try:
             results = await self._searcher.search(
-                query=query.strip(),
-                max_results=max_results,
-                allowed_domains=allowed_domains,
-                blocked_domains=blocked_domains,
+                query=user_msg,
+                max_results=self._config.max_results,
             )
         except Exception as exc:
-            logger.error(f"web_search exception: {exc}", exc_info=True)
-            yield event.plain_result(f"[web_search Error] 搜索失败：{exc}")
+            logger.error(f"auto-search failed: {exc}")
             return
 
         if not results:
-            yield event.plain_result(f'未找到与 "{query}" 相关的结果。')
             return
 
-        # 格式化为 Markdown
-        lines = [f"## Search Results for: {query}", ""]
+        # 构建搜索上下文
+        ctx_lines = [
+            "## [Web Search Context — use this to answer accurately, cite sources briefly]",
+            "",
+        ]
         for i, r in enumerate(results, 1):
-            lines.append(f"{i}. **{r['title']}**")
-            lines.append(f"   {r['url']}")
-            if r.get("snippet"):
-                snippet = r["snippet"].replace("\n", " ").strip()
-                lines.append(f"   > {snippet[:300]}")
-            lines.append("")
+            snippet = r.get("snippet", "").replace("\n", " ").strip()
+            ctx_lines.append(f"{i}. {r['title']} - {r['url']}")
+            if snippet:
+                ctx_lines.append(f"   {snippet[:200]}")
+            ctx_lines.append("")
 
-        output = "\n".join(lines)
-        yield event.plain_result(output)
+        ctx_lines.append("[End of search context]")
+        context_block = "\n".join(ctx_lines)
 
-    # ---- LLM 工具: web_fetch ------------------------------------------------
+        # 注入 system prompt
+        if req.system_prompt:
+            req.system_prompt = context_block + "\n\n" + req.system_prompt
+        else:
+            req.system_prompt = context_block
 
-    @filter.llm_tool(name="web_fetch")
-    async def web_fetch(self, event: AstrMessageEvent, url: str):
-        """
-        获取并阅读一个网页的完整内容。当搜索结果的摘要不够详细、
-        需要查看完整文章 / 文档 / 新闻时使用。
 
-        Args:
-            url(string): 要获取的网页完整 URL（含 https://）。
-        """
-        await self._ensure_initialized()
+def _get_event_text(event: AstrMessageEvent) -> str:
+    """从事件中提取用户消息文本。"""
+    try:
+        msg = event.message_str
+        if msg:
+            return msg.strip()
+    except Exception:
+        pass
 
-        if not url or not url.strip():
-            yield event.plain_result("[web_fetch Error] url 不能为空。")
-            return
+    try:
+        for seg in event.message_obj.message:
+            text = getattr(seg, "text", None)
+            if text:
+                return text.strip()
+    except Exception:
+        pass
 
-        url = url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        logger.info(f"web_fetch: url='{url[:120]}'")
-
-        try:
-            content = await self._fetcher.fetch(url)
-        except Exception as exc:
-            logger.error(f"web_fetch exception: {exc}", exc_info=True)
-            yield event.plain_result(f"[web_fetch Error] 获取失败：{exc}")
-            return
-
-        output = f"## Content from: {url}\n\n{content}"
-        yield event.plain_result(output)
+    return ""
