@@ -1,52 +1,60 @@
 # Web Search Auto - 自动网络搜索
 
-基于 [SearXNG](https://github.com/searxng/searxng) 的 AstrBot 插件，LLM 自主决定何时搜索网络，**无需命令前缀**。
-
 参考 Claude Code 的 WebSearch / WebFetch 工具设计。
 
-## 功能
+LLM 无需命令前缀，无需 function calling。后台自动搜索，结果注入上下文，LLM 自然筛选回复。
 
-| 工具 | 说明 |
-|------|------|
-| `web_search` | 搜索网络，返回标题、URL、摘要 |
-| `web_fetch` | 获取网页全文，提取正文内容 |
+默认爬取 Bing（cn.bing.com），国内直连，零部署。
 
-LLM 会自动判断何时需要搜索——用户只需正常聊天，无需打 `/search` 之类的命令。
+## 工作原理
+
+```
+用户消息 → 插件拦截 → 后台自动搜 → 搜索结果注入 system prompt
+        → LLM 基于上下文自然回复（自己筛选、总结、引用）
+```
+
+不需要 LLM 支持 function calling，弱模型也能用。
 
 ## 安装
 
-1. 确保有运行中的 SearXNG 实例
-2. 将插件目录放入 `AstrBot/data/plugins/astrbot_plugin_web_search_auto/`
-3. 重启 AstrBot 或在 WebUI 中重载插件
+1. 插件目录放入 `AstrBot/data/plugins/astrbot_plugin_web_search_auto/`
+2. WebUI 重载插件，默认即可用（Bing 直连，无需任何配置）
+
+## 搜索后端
+
+| 后端 | 说明 |
+|------|------|
+| **bing**（默认） | 爬取 cn.bing.com，国内直连 |
+| duckduckgo | ddgs 库，需 `pip install ddgs` |
+| searxng | 自托管 SearXNG API |
 
 ## 配置
 
-在 AstrBot WebUI 的插件管理页面配置：
-
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `searxng_url` | `http://localhost:8080` | SearXNG 实例地址 |
-| `max_results` | `10` | 搜索返回的最大结果数 (1-20) |
-| `cache_ttl` | `900` | 页面缓存有效期（秒，0=禁用） |
+| `search_backend` | `bing` | bing / duckduckgo / searxng |
+| `proxy` | `` | HTTP 代理，如 `http://127.0.0.1:7890` |
+| `max_results` | `5` | 注入上下文的搜索结果数 |
+| `cache_ttl` | `900` | 页面缓存秒数 (0=禁用) |
 | `cache_max_size` | `100` | 缓存最大条目数 |
-| `fetch_timeout` | `15` | 页面获取超时（秒） |
+| `fetch_timeout` | `15` | 页面获取超时秒数 |
 | `fetch_max_chars` | `10000` | 提取正文最大字符数 |
-| `enable_prompt_hint` | `true` | 注入系统提示帮助 LLM 理解何时搜索 |
 
 ## 使用示例
 
 ```
-用户: 最近有什么 AI 新闻？
-LLM:  [自动调用 web_search("latest AI news 2026")]
-     → 基于搜索结果回答
+用户: LuckPerms 怎么给玩家权限？
+→ 插件后台搜 "LuckPerms 怎么给玩家权限"
+→ 搜索结果注入 LLM 上下文
+→ LLM: LuckPerms 通过 /lp user <玩家> permission set <权限> 来设置...
 
-用户: 这个链接讲了什么？https://example.com/article
-LLM:  [自动调用 web_fetch("https://example.com/article")]
-     → 总结文章内容
+用户: Python 3.13 什么时候发布的？
+→ 自动搜 → LLM 自然回答发布日期和相关特性
 ```
 
 ## 依赖
 
-- `aiohttp` — 异步 HTTP
-- `beautifulsoup4` + `lxml` — HTML 正文提取
-- SearXNG — 搜索后端（自行部署）
+```
+aiohttp beautifulsoup4 lxml
+# duckduckgo 后端需额外: ddgs
+```

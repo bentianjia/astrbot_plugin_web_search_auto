@@ -1,44 +1,53 @@
 {
+  "search_backend": {
+    "type": "string",
+    "label": "搜索后端",
+    "default": "bing",
+    "description": "bing = 爬 cn.bing.com（国内直连，默认）；duckduckgo = ddgs 库；searxng = 自托管"
+  },
   "searxng_url": {
     "type": "string",
-    "label": "SearXNG 实例地址",
+    "label": "SearXNG 地址（searxng 后端时生效）",
     "default": "http://localhost:8080",
-    "description": "SearXNG 搜索后端的地址，不带尾部斜杠"
+    "description": "SearXNG 实例 URL"
+  },
+  "proxy": {
+    "type": "string",
+    "label": "代理地址",
+    "default": "",
+    "description": "HTTP/HTTPS 代理，如 http://127.0.0.1:7890。Bing 后端默认不需要"
   },
   "max_results": {
     "type": "int",
-    "label": "默认搜索结果数",
-    "default": 10,
-    "description": "web_search 每次返回的最大结果数量（1-20）"
+    "label": "搜索结果数",
+    "default": 5,
+    "description": "1-20，建议 5 以内避免 LLM 原文照搬"
   },
   "cache_ttl": {
     "type": "int",
-    "label": "页面缓存有效期（秒）",
+    "label": "缓存有效期（秒）",
     "default": 900,
-    "description": "web_fetch 获取的页面缓存时间，设 0 禁用缓存"
+    "description": "设 0 禁用缓存"
   },
   "cache_max_size": {
     "type": "int",
-    "label": "缓存最大条目数",
+    "label": "缓存最大条目",
     "default": 100,
-    "description": "最多缓存多少个页面，超出后淘汰最旧条目"
+    "description": "超出淘汰最旧条目"
   },
   "fetch_timeout": {
     "type": "int",
-    "label": "页面获取超时（秒）",
-    "default": 15,
-    "description": "web_fetch 请求单个页面的超时时间"
+    "label": "页面超时（秒）",
+    "default": 15
   },
   "fetch_max_chars": {
     "type": "int",
-    "label": "页面内容截取长度",
-    "default": 10000,
-    "description": "web_fetch 提取的文本最大字符数，超出截断"
+    "label": "页面截取长度",
+    "default": 10000
   },
   "enable_prompt_hint": {
     "type": "bool",
     "label": "注入系统提示词",
-    "default": true,
-    "description": "是否在系统提示中注入 web_search/web_fetch 使用说明，帮助 LLM 理解何时调用"
+    "default": true
   }
 }
