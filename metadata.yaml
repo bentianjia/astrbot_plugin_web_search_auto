@@ -1,9 +1,12 @@
 name: web_search_auto
-author: AstrBot Community
+author: bentianjia
 display_name: Web Search Auto - 自动网络搜索
-desc: 基于 SearXNG 的自动网络搜索插件，LLM 自主决定何时搜索，无需指令前缀。提供 web_search 和 web_fetch 两个 LLM 工具。
-version: 1.0.0
-repo: https://github.com/yourname/astrbot_plugin_web_search_auto
+desc: >-
+  自动网络搜索插件，默认用 DuckDuckGo 直接搜（零部署，无需 API Key），
+  也可切换 SearXNG。LLM 自主决定何时搜索，无需命令前缀。
+  参考 Claude Code 的 WebSearch / WebFetch 工具设计。
+version: 1.1.0
+repo: https://github.com/bentianjia/astrbot_plugin_web_search_auto
 support_platforms:
   - aiocqhttp
   - telegram
